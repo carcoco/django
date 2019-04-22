@@ -1,5 +1,7 @@
+from unittest import mock
+
 from django.db import transaction
-from django.test import TestCase
+from django.test import TestCase, skipUnlessDBFeature
 
 from .models import Article, InheritedArticleA, InheritedArticleB, Publication
 
@@ -27,9 +29,13 @@ class ManyToManyTests(TestCase):
 
     def test_add(self):
         # Create an Article.
-        a5 = Article(headline='Django lets you reate Web apps easily')
+        a5 = Article(headline='Django lets you create Web apps easily')
         # You can't associate it with a Publication until it's been saved.
-        with self.assertRaises(ValueError):
+        msg = (
+            '"<Article: Django lets you create Web apps easily>" needs to have '
+            'a value for field "id" before this many-to-many relationship can be used.'
+        )
+        with self.assertRaisesMessage(ValueError, msg):
             getattr(a5, 'publications')
         # Save it!
         a5.save()
@@ -53,7 +59,8 @@ class ManyToManyTests(TestCase):
         )
 
         # Adding an object of the wrong type raises TypeError
-        with self.assertRaisesMessage(TypeError, "'Publication' instance expected, got <Article"):
+        msg = "'Publication' instance expected, got <Article: Django lets you create Web apps easily>"
+        with self.assertRaisesMessage(TypeError, msg):
             with transaction.atomic():
                 a6.publications.add(a5)
 
@@ -106,6 +113,29 @@ class ManyToManyTests(TestCase):
                 '<Publication: The Python Journal>',
             ]
         )
+
+    @skipUnlessDBFeature('supports_ignore_conflicts')
+    def test_fast_add_ignore_conflicts(self):
+        """
+        A single query is necessary to add auto-created through instances if
+        the database backend supports bulk_create(ignore_conflicts) and no
+        m2m_changed signals receivers are connected.
+        """
+        with self.assertNumQueries(1):
+            self.a1.publications.add(self.p1, self.p2)
+
+    @skipUnlessDBFeature('supports_ignore_conflicts')
+    def test_slow_add_ignore_conflicts(self):
+        manager_cls = self.a1.publications.__class__
+        # Simulate a race condition between the missing ids retrieval and
+        # the bulk insertion attempt.
+        missing_target_ids = {self.p1.id}
+        # Disable fast-add to test the case where the slow add path is taken.
+        add_plan = (True, False, False)
+        with mock.patch.object(manager_cls, '_get_missing_target_ids', return_value=missing_target_ids) as mocked:
+            with mock.patch.object(manager_cls, '_get_add_plan', return_value=add_plan):
+                self.a1.publications.add(self.p1)
+        mocked.assert_called_once()
 
     def test_related_sets(self):
         # Article objects have access to their related Publication objects.
@@ -550,3 +580,9 @@ class ManyToManyTests(TestCase):
             ]
         )
         self.assertQuerysetEqual(b.publications.all(), ['<Publication: Science Weekly>'])
+
+    def test_custom_default_manager_exists_count(self):
+        a5 = Article.objects.create(headline='deleted')
+        a5.publications.add(self.p2)
+        self.assertEqual(self.p2.article_set.count(), self.p2.article_set.all().count())
+        self.assertEqual(self.p3.article_set.exists(), self.p3.article_set.all().exists())
